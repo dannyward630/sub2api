@@ -10,7 +10,7 @@ import (
 // geminiImageOutputCounterKey 是请求级内联图片计数器挂在 gin.Context 上的键。
 const geminiImageOutputCounterKey = "gemini_image_output_counter"
 
-// geminiImageOutputCounter 记录一次转发里 Gemini 上游真正回吐的内联图片数量。
+// geminiImageOutputCounter 记录一次转发里 Gemini 上游真正回吐的图片数量。
 //
 // 取「单个 payload 内的最大值」而不是累加：Gemini 兼容上游的 SSE 分片可能是
 // 累积式的（同一份内容在后续 chunk 里重复整段回来——本文件同目录的
@@ -47,7 +47,7 @@ func geminiImageOutputCounterFromContext(c *gin.Context) *geminiImageOutputCount
 	return counter
 }
 
-// observeGeminiImageOutputs 观测一段上游响应（整份或单个 chunk）里的内联图片。
+// observeGeminiImageOutputs 观测一段上游响应（整份或单个 chunk）里的图片。
 // 调用点与 upstreamResponseModelObserver.ObserveGemini 一一对应——那里拿得到
 // 解包后的上游响应体，这里需要的是同一份字节。
 func observeGeminiImageOutputs(c *gin.Context, payload []byte) {
@@ -55,7 +55,7 @@ func observeGeminiImageOutputs(c *gin.Context, payload []byte) {
 	if counter == nil {
 		return
 	}
-	if count := countGeminiInlineImageOutputs(payload); count > counter.count {
+	if count := countGeminiImageOutputs(payload); count > counter.count {
 		counter.count = count
 	}
 }
@@ -76,9 +76,9 @@ func observedGeminiImageOutputs(c *gin.Context) int {
 // 于是 ImageCount=0，calculateRecordUsageCost 整条按次计费分支不触发，
 // 生图请求全部记 $0。
 //
-// 只有响应里数不出图时（例如上游用 fileData 引用而非 inlineData 回图，或聚合
-// 函数丢掉了图片 part）才退回既有的模型名启发式，保证老行为不回退；这里额外
-// 也认映射后的上游模型名，与 shouldSkipCodexPlanGatedImageModelCooldown 对
+// 只有响应里数不出图时（例如聚合函数丢掉了图片 part，或上游格式不受支持）
+// 才退回既有的模型名启发式，保证老行为不回退；这里额外也认映射后的上游模型名，
+// 与 shouldSkipCodexPlanGatedImageModelCooldown 对
 // requestedModel / modelKey 双取的口径一致。
 func resolveGeminiImageCount(c *gin.Context, originalModel, mappedModel string) int {
 	if observed := observedGeminiImageOutputs(c); observed > 0 {
@@ -90,17 +90,17 @@ func resolveGeminiImageCount(c *gin.Context, originalModel, mappedModel string) 
 	return 0
 }
 
-// countGeminiInlineImageOutputs 统计一段 Gemini 响应 JSON 里的内联图片 part。
-// Gemini REST 回 camelCase 的 inlineData，官方 SDK 与部分中转会回 snake_case
-// 的 inline_data，两种都要认。
-func countGeminiInlineImageOutputs(payload []byte) int {
+// countGeminiImageOutputs 统计一段 Gemini 响应 JSON 里的图片 part。
+// Gemini 可用 inlineData 提供图片内容，也可用 fileData 引用图片；两种形式
+// 都可能以 camelCase 或 snake_case 返回。
+func countGeminiImageOutputs(payload []byte) int {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return 0
 	}
 	count := 0
 	gjson.GetBytes(payload, "candidates").ForEach(func(_, candidate gjson.Result) bool {
 		candidate.Get("content.parts").ForEach(func(_, part gjson.Result) bool {
-			if geminiPartIsInlineImage(part) {
+			if geminiPartIsImageOutput(part) {
 				count++
 			}
 			return true
@@ -110,23 +110,30 @@ func countGeminiInlineImageOutputs(payload []byte) int {
 	return count
 }
 
-func geminiPartIsInlineImage(part gjson.Result) bool {
-	inline := part.Get("inlineData")
-	if !inline.Exists() {
-		inline = part.Get("inline_data")
-	}
-	if !inline.Exists() {
+func geminiPartIsImageOutput(part gjson.Result) bool {
+	return geminiImagePayloadIsPresent(part.Get("inlineData"), "data", "") ||
+		geminiImagePayloadIsPresent(part.Get("inline_data"), "data", "") ||
+		geminiImagePayloadIsPresent(part.Get("fileData"), "fileUri", "file_uri") ||
+		geminiImagePayloadIsPresent(part.Get("file_data"), "fileUri", "file_uri")
+}
+
+func geminiImagePayloadIsPresent(payload gjson.Result, camelContentField, snakeContentField string) bool {
+	if !payload.Exists() {
 		return false
 	}
 
-	mimeType := inline.Get("mimeType")
+	mimeType := payload.Get("mimeType")
 	if !mimeType.Exists() {
-		mimeType = inline.Get("mime_type")
+		mimeType = payload.Get("mime_type")
 	}
 	if !isGeminiInlineImageMIMEType(strings.ToLower(strings.TrimSpace(mimeType.String()))) {
 		return false
 	}
 
-	// 只认真的带上了 base64 数据的 part，空壳 part 不计费。
-	return strings.TrimSpace(inline.Get("data").String()) != ""
+	content := payload.Get(camelContentField)
+	if !content.Exists() && snakeContentField != "" {
+		content = payload.Get(snakeContentField)
+	}
+	// 空 Base64 数据或空文件 URI 不计费。
+	return strings.TrimSpace(content.String()) != ""
 }

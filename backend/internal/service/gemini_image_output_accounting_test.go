@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -28,7 +29,7 @@ func geminiImageResponse(parts string) string {
 	return `{"candidates":[{"content":{"role":"model","parts":[` + parts + `]},"finishReason":"STOP"}]}`
 }
 
-func TestCountGeminiInlineImageOutputs(t *testing.T) {
+func TestCountGeminiImageOutputs(t *testing.T) {
 	cases := []struct {
 		name    string
 		payload string
@@ -58,6 +59,28 @@ func TestCountGeminiInlineImageOutputs(t *testing.T) {
 			want: 2,
 		},
 		{
+			name:    "camelCase fileData",
+			payload: geminiImageResponse(`{"fileData":{"mimeType":"image/jpeg","fileUri":"https://example.test/image.jpg"}}`),
+			want:    1,
+		},
+		{
+			name:    "snake_case file_data",
+			payload: geminiImageResponse(`{"file_data":{"mime_type":"image/jpeg","file_uri":"https://example.test/image.jpg"}}`),
+			want:    1,
+		},
+		{
+			name: "text and file image mixed",
+			payload: geminiImageResponse(`{"text":"here you go"},` +
+				`{"file_data":{"mime_type":"image/png","file_uri":"https://example.test/image.png"}}`),
+			want: 1,
+		},
+		{
+			name: "multiple file images",
+			payload: geminiImageResponse(`{"fileData":{"mimeType":"image/png","fileUri":"https://example.test/one.png"}},` +
+				`{"file_data":{"mime_type":"image/webp","file_uri":"https://example.test/two.webp"}}`),
+			want: 2,
+		},
+		{
 			name:    "uppercase mime type",
 			payload: geminiImageResponse(`{"inlineData":{"mimeType":"IMAGE/PNG","data":"` + geminiTestPNG + `"}}`),
 			want:    1,
@@ -78,6 +101,16 @@ func TestCountGeminiInlineImageOutputs(t *testing.T) {
 			payload: geminiImageResponse(`{"inlineData":{"mimeType":"image/png","data":""}}`),
 			want:    0,
 		},
+		{
+			name:    "empty file URI is not billable",
+			payload: geminiImageResponse(`{"fileData":{"mimeType":"image/png","fileUri":"  "}}`),
+			want:    0,
+		},
+		{
+			name:    "non image file MIME is not billable",
+			payload: geminiImageResponse(`{"file_data":{"mime_type":"application/pdf","file_uri":"https://example.test/document.pdf"}}`),
+			want:    0,
+		},
 		{name: "empty payload", payload: "", want: 0},
 		{name: "invalid json", payload: "not-json", want: 0},
 		{name: "error response", payload: `{"error":{"code":429,"message":"quota"}}`, want: 0},
@@ -85,7 +118,7 @@ func TestCountGeminiInlineImageOutputs(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			require.Equal(t, tc.want, countGeminiInlineImageOutputs([]byte(tc.payload)))
+			require.Equal(t, tc.want, countGeminiImageOutputs([]byte(tc.payload)))
 		})
 	}
 }
@@ -138,16 +171,18 @@ func TestBeginGeminiImageOutputObservation_ResetsPerForward(t *testing.T) {
 // generateContent 生图，改动前 ImageCount 恒为 0，calculateRecordUsageCost 的按次
 // 计费分支整条不触发，四次生图全部记 $0。
 func TestResolveGeminiImageCount(t *testing.T) {
-	oneImage := []byte(geminiImageResponse(`{"inlineData":{"mimeType":"image/png","data":"` + geminiTestPNG + `"}}`))
 	textOnly := []byte(geminiImageResponse(`{"text":"hello"}`))
 
 	t.Run("custom model name bills by observed images", func(t *testing.T) {
 		c := newGeminiImageTestContext(t)
 		beginGeminiImageOutputObservation(c)
-		observeGeminiImageOutputs(c, oneImage)
+		fileImages := []byte(geminiImageResponse(
+			`{"file_data":{"mime_type":"image/jpeg","file_uri":"https://example.test/one.jpg"}},` +
+				`{"file_data":{"mime_type":"image/png","file_uri":"https://example.test/two.png"}}`))
+		observeGeminiImageOutputs(c, fileImages)
 
-		require.False(t, isImageGenerationModel("nana-banana-2"), "前置条件：白名单判不出自定义名")
-		require.Equal(t, 1, resolveGeminiImageCount(c, "nana-banana-2", "nana-banana-2"))
+		require.False(t, isImageGenerationModel("gemini-nano-banana-2.1"), "前置条件：白名单判不出自定义名")
+		require.Equal(t, 2, resolveGeminiImageCount(c, "gemini-nano-banana-2.1", "gemini-nano-banana-2.1"))
 	})
 
 	t.Run("falls back to requested model name", func(t *testing.T) {
@@ -179,6 +214,29 @@ func TestResolveGeminiImageCount(t *testing.T) {
 		require.Equal(t, 0, resolveGeminiImageCount(c, "nana-banana-2", "nana-banana-2"))
 		require.Equal(t, 1, resolveGeminiImageCount(c, "gemini-3-pro-image", "gemini-3-pro-image"))
 	})
+}
+
+func TestGeminiFileDataImageCountUsesImagePricing(t *testing.T) {
+	groupID := int64(8300)
+	model := "gemini-nano-banana-2.1"
+	resolver := newOpenAIImageChannelPricingResolverForTest(t, groupID, model, 0.25)
+	svc := &GatewayService{billingService: resolver.billingService, resolver: resolver}
+	c := newGeminiImageTestContext(t)
+	beginGeminiImageOutputObservation(c)
+	observeGeminiImageOutputs(c, []byte(geminiImageResponse(
+		`{"file_data":{"mime_type":"image/jpeg","file_uri":"https://example.test/one.jpg"}},`+
+			`{"file_data":{"mime_type":"image/jpeg","file_uri":"https://example.test/two.jpg"}}`)))
+
+	imageCount := resolveGeminiImageCount(c, model, model)
+	require.Equal(t, 2, imageCount)
+	apiKey := &APIKey{GroupID: &groupID, Group: &Group{ID: groupID}}
+	cost := svc.calculateRecordUsageCost(c.Request.Context(), &ForwardResult{
+		Model: model, ImageCount: imageCount, ImageSize: "1K",
+	}, apiKey, model, 1, 1, time.Time{})
+
+	require.NotNil(t, cost)
+	require.Equal(t, string(BillingModeImage), cost.BillingMode)
+	require.InDelta(t, 0.5, cost.TotalCost, 1e-12)
 }
 
 // 端到端守住接线：/v1beta/models/{model}:generateContent 的非流式响应体
